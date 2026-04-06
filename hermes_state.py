@@ -32,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -89,6 +89,16 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+"""
+
+SEMANTIC_EMBEDDING_SQL = """
+CREATE TABLE IF NOT EXISTS session_embeddings (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    embedding BLOB NOT NULL,
+    model TEXT NOT NULL,
+    embedded_text TEXT NOT NULL,
+    computed_at REAL NOT NULL
+);
 """
 
 FTS_SQL = """
@@ -330,6 +340,12 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: session_embeddings table for semantic (vector) session search.
+                # Stores one float32 embedding blob per session, keyed by session_id.
+                # ON DELETE CASCADE keeps the table clean when sessions are deleted.
+                cursor.executescript(SEMANTIC_EMBEDDING_SQL)
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -346,6 +362,9 @@ class SessionDB:
             cursor.execute("SELECT * FROM messages_fts LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(FTS_SQL)
+
+        # Semantic embedding table — safe to run on fresh DBs and after migration
+        cursor.executescript(SEMANTIC_EMBEDDING_SQL)
 
         self._conn.commit()
 
@@ -1145,6 +1164,150 @@ class SessionDB:
             match.pop("content", None)
 
         return matches
+
+    # =========================================================================
+    # Semantic embedding storage
+    # =========================================================================
+
+    def get_session_text_for_embedding(self, session_id: str) -> Optional[str]:
+        """Return a short text representation of a session suitable for embedding.
+
+        Concatenates title + first user message (up to 500 chars) + first
+        assistant text (up to 300 chars).  Returns None when the session has
+        no embeddable content.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT title FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        if not row:
+            return None
+        title = (row["title"] or "").strip()
+
+        with self._lock:
+            first_user = self._conn.execute(
+                """SELECT content FROM messages
+                   WHERE session_id = ? AND role = 'user' AND content IS NOT NULL
+                   ORDER BY timestamp, id LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+            first_asst = self._conn.execute(
+                """SELECT content FROM messages
+                   WHERE session_id = ? AND role = 'assistant' AND content IS NOT NULL
+                   ORDER BY timestamp, id LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+
+        parts = []
+        if title:
+            parts.append(title)
+        if first_user and first_user["content"]:
+            parts.append(first_user["content"][:500])
+        if first_asst and first_asst["content"]:
+            parts.append(first_asst["content"][:300])
+
+        text = "\n".join(parts).strip()
+        return text or None
+
+    def store_session_embedding(
+        self,
+        session_id: str,
+        embedding: bytes,
+        model: str,
+        embedded_text: str,
+    ) -> None:
+        """Upsert a pre-computed embedding blob for a session."""
+        def _do(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO session_embeddings
+                   (session_id, embedding, model, embedded_text, computed_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, embedding, model, embedded_text, time.time()),
+            )
+        self._execute_write(_do)
+
+    def get_session_embeddings(
+        self,
+        session_ids: Optional[List[str]] = None,
+        exclude_sources: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Load stored embeddings.
+
+        When *session_ids* is None, returns all embeddings (filtered by
+        *exclude_sources* when provided).  When *session_ids* is given,
+        returns only those matching the IDs.
+        Each dict has keys: session_id, embedding (bytes), model.
+        """
+        with self._lock:
+            if session_ids is not None:
+                if not session_ids:
+                    return []
+                placeholders = ",".join("?" * len(session_ids))
+                cursor = self._conn.execute(
+                    f"SELECT se.session_id, se.embedding, se.model"
+                    f" FROM session_embeddings se"
+                    f" WHERE se.session_id IN ({placeholders})",
+                    session_ids,
+                )
+            elif exclude_sources:
+                ph = ",".join("?" * len(exclude_sources))
+                cursor = self._conn.execute(
+                    f"SELECT se.session_id, se.embedding, se.model"
+                    f" FROM session_embeddings se"
+                    f" JOIN sessions s ON s.id = se.session_id"
+                    f" WHERE s.source NOT IN ({ph})",
+                    exclude_sources,
+                )
+            else:
+                cursor = self._conn.execute(
+                    "SELECT session_id, embedding, model FROM session_embeddings"
+                )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_sessions_without_embeddings(
+        self,
+        exclude_sources: Optional[List[str]] = None,
+        limit: int = 200,
+    ) -> List[str]:
+        """Return session IDs that have no stored embedding yet.
+
+        Only returns root sessions (parent_session_id IS NULL) since we embed
+        at the top-level conversation granularity.
+        """
+        where = ["s.parent_session_id IS NULL",
+                 "se.session_id IS NULL"]
+        params: list = []
+        if exclude_sources:
+            ph = ",".join("?" * len(exclude_sources))
+            where.append(f"s.source NOT IN ({ph})")
+            params.extend(exclude_sources)
+        params.append(limit)
+        sql = f"""
+            SELECT s.id FROM sessions s
+            LEFT JOIN session_embeddings se ON se.session_id = s.id
+            WHERE {" AND ".join(where)}
+            ORDER BY s.started_at DESC
+            LIMIT ?
+        """
+        with self._lock:
+            cursor = self._conn.execute(sql, params)
+            return [row[0] for row in cursor.fetchall()]
+
+    def get_all_root_session_ids(
+        self,
+        exclude_sources: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Return IDs of all root sessions (no parent), optionally filtered."""
+        where = ["parent_session_id IS NULL"]
+        params: list = []
+        if exclude_sources:
+            ph = ",".join("?" * len(exclude_sources))
+            where.append(f"source NOT IN ({ph})")
+            params.extend(exclude_sources)
+        sql = f"SELECT id FROM sessions WHERE {' AND '.join(where)} ORDER BY started_at DESC"
+        with self._lock:
+            cursor = self._conn.execute(sql, params)
+            return [row[0] for row in cursor.fetchall()]
 
     def search_sessions(
         self,

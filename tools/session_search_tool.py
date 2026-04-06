@@ -22,6 +22,11 @@ import logging
 from typing import Dict, Any, List, Optional, Union
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+from tools.semantic_search import (
+    semantic_search_sessions,
+    reciprocal_rank_fusion,
+    is_available as semantic_available,
+)
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
 
@@ -275,24 +280,6 @@ def session_search(
         if role_filter and role_filter.strip():
             role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
 
-        # FTS5 search -- get matches ranked by relevance
-        raw_results = db.search_messages(
-            query=query,
-            role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            limit=50,  # Get more matches to find unique sessions
-            offset=0,
-        )
-
-        if not raw_results:
-            return json.dumps({
-                "success": True,
-                "query": query,
-                "results": [],
-                "count": 0,
-                "message": "No matching sessions found.",
-            }, ensure_ascii=False)
-
         # Resolve child sessions to their parent — delegation stores detailed
         # content in child sessions, but the user's conversation is the parent.
         def _resolve_to_parent(session_id: str) -> str:
@@ -324,23 +311,85 @@ def session_search(
             _resolve_to_parent(current_session_id) if current_session_id else None
         )
 
-        # Group by resolved (parent) session_id, dedup, skip the current
-        # session lineage. Compression and delegation create child sessions
-        # that still belong to the same active conversation.
-        seen_sessions = {}
+        # --- FTS5 search (always runs) ---
+        raw_results = db.search_messages(
+            query=query,
+            role_filter=role_list,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            limit=50,  # Get more matches to find unique sessions
+            offset=0,
+        )
+
+        # Build FTS5 ranking: list of resolved root session IDs (deduped, ordered by rank)
+        # Also collect match metadata so we don't have to re-query for summaries later.
+        fts_meta: Dict[str, Dict] = {}   # resolved_sid -> match_info from FTS5
+        fts_ranked: List[str] = []
+        excluded_lineage = {current_lineage_root} if current_lineage_root else set()
+
         for result in raw_results:
             raw_sid = result["session_id"]
             resolved_sid = _resolve_to_parent(raw_sid)
-            # Skip the current session lineage — the agent already has that
-            # context, even if older turns live in parent fragments.
-            if current_lineage_root and resolved_sid == current_lineage_root:
+            if resolved_sid in excluded_lineage:
                 continue
             if current_session_id and raw_sid == current_session_id:
                 continue
-            if resolved_sid not in seen_sessions:
-                result = dict(result)
-                result["session_id"] = resolved_sid
-                seen_sessions[resolved_sid] = result
+            if resolved_sid not in fts_meta:
+                r = dict(result)
+                r["session_id"] = resolved_sid
+                fts_meta[resolved_sid] = r
+                fts_ranked.append(resolved_sid)
+
+        # --- Semantic search (runs when embedding backend is available) ---
+        sem_ranked: List[str] = []
+        search_mode = "keyword"
+        if semantic_available():
+            try:
+                sem_ranked = semantic_search_sessions(
+                    db,
+                    query=query,
+                    exclude_sources=_HIDDEN_SESSION_SOURCES,
+                    exclude_session_ids=excluded_lineage,
+                    limit=limit * 4,
+                )
+                if sem_ranked:
+                    search_mode = "hybrid"
+            except Exception as exc:
+                logging.debug("Semantic search failed, falling back to FTS5: %s", exc)
+
+        # --- Merge via Reciprocal Rank Fusion ---
+        if sem_ranked:
+            rankings = [r for r in [fts_ranked, sem_ranked] if r]
+            merged_sids = reciprocal_rank_fusion(rankings)
+        else:
+            merged_sids = fts_ranked
+
+        if not merged_sids:
+            return json.dumps({
+                "success": True,
+                "query": query,
+                "results": [],
+                "count": 0,
+                "message": "No matching sessions found.",
+            }, ensure_ascii=False)
+
+        # Build seen_sessions from merged ranking, loading metadata for semantic-only hits
+        seen_sessions: Dict[str, Dict] = {}
+        for resolved_sid in merged_sids:
+            if resolved_sid in fts_meta:
+                seen_sessions[resolved_sid] = fts_meta[resolved_sid]
+            else:
+                # Session surfaced by semantic search only — load metadata from DB
+                try:
+                    session_row = db.get_session(resolved_sid)
+                    if session_row:
+                        seen_sessions[resolved_sid] = {
+                            "session_id": resolved_sid,
+                            "session_started": session_row.get("started_at"),
+                            "source": session_row.get("source", "unknown"),
+                            "model": session_row.get("model"),
+                        }
+                except Exception as exc:
+                    logging.debug("Could not load session metadata for %s: %s", resolved_sid, exc)
             if len(seen_sessions) >= limit:
                 break
 
@@ -420,6 +469,7 @@ def session_search(
         return json.dumps({
             "success": True,
             "query": query,
+            "search_mode": search_mode,
             "results": summaries,
             "count": len(summaries),
             "sessions_searched": len(seen_sessions),
@@ -448,8 +498,11 @@ SESSION_SEARCH_SCHEMA = {
         "1. Recent sessions (no query): Call with no arguments to see what was worked on recently. "
         "Returns titles, previews, and timestamps. Zero LLM cost, instant. "
         "Start here when the user asks what were we working on or what did we do recently.\n"
-        "2. Keyword search (with query): Search for specific topics across all past sessions. "
-        "Returns LLM-generated summaries of matching sessions.\n\n"
+        "2. Search (with query): Search for specific topics across all past sessions using both "
+        "keyword matching (FTS5) and semantic similarity (vector embeddings, when available). "
+        "Semantic search finds conceptually related sessions even when exact words differ — "
+        "e.g. 'CORS error debugging' will surface sessions about cross-origin issues even if "
+        "they never used the word 'CORS'. Returns LLM-generated summaries of matching sessions.\n\n"
         "USE THIS PROACTIVELY when:\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
         "- The user asks about a topic you worked on before but don't have in current context\n"
@@ -458,11 +511,10 @@ SESSION_SEARCH_SCHEMA = {
         "- The user asks 'what did we do about X?' or 'how did we fix Y?'\n\n"
         "Don't hesitate to search when it is actually cross-session -- it's fast and cheap. "
         "Better to search and confirm than to guess or ask the user to repeat themselves.\n\n"
-        "Search syntax: keywords joined with OR for broad recall (elevenlabs OR baseten OR funding), "
-        "phrases for exact match (\"docker networking\"), boolean (python NOT java), prefix (deploy*). "
-        "IMPORTANT: Use OR between keywords for best results — FTS5 defaults to AND which misses "
-        "sessions that only mention some terms. If a broad OR query returns nothing, try individual "
-        "keyword searches in parallel. Returns summaries of the top matching sessions."
+        "SEARCH TIPS: Use natural language descriptions for semantic search ('debugging auth token "
+        "expiry') or keywords with OR for broad recall ('docker OR kubernetes'). Phrases for exact "
+        "match (\"docker networking\"), boolean (python NOT java), prefix (deploy*). "
+        "Results include a search_mode field ('keyword' or 'hybrid') indicating which backends ran."
     ),
     "parameters": {
         "type": "object",

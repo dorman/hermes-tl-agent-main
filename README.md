@@ -18,7 +18,7 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 <table>
 <tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
-<tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. FTS5 session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
+<tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. Hybrid keyword + semantic (vector embedding) session search for cross-session recall — finds "that time I debugged a CORS issue" even without exact words. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
 <tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
 <tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams with specialized roles (researcher, coder, reviewer, tester) — each with a tailored system prompt, toolset, and constraints. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
 <tr><td><b>Runs anywhere, not just your laptop</b></td><td>Six terminal backends — local, Docker, SSH, Daytona, Singularity, and Modal. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
@@ -132,6 +132,44 @@ What gets imported:
 - **Workspace instructions** — AGENTS.md (with `--workspace-target`)
 
 See `hermes claw migrate --help` for all options, or use the `openclaw-migration` skill for an interactive agent-guided migration with dry-run previews.
+
+---
+
+## Semantic Session Search
+
+Hermes searches past conversations using both keyword matching (FTS5) and vector embeddings, merged with Reciprocal Rank Fusion. This means it can surface "that time I debugged a similar CORS issue" automatically — without requiring you to remember the exact words used.
+
+**How it works:**
+
+1. Each past session is embedded once (title + first user message + first assistant response) and stored in `~/.hermes/state.db`.
+2. When you search, the query is embedded with the same model and compared against all stored session embeddings by cosine similarity.
+3. Semantic results are merged with FTS5 keyword results — sessions appearing in both rank higher.
+4. The top matches are summarized by an auxiliary LLM and returned.
+
+Embeddings are computed **lazily** — missing sessions are embedded at search time (up to 200 per call, within 8 seconds) and cached permanently. No background jobs, no blocking session writes.
+
+**Enabling semantic search:**
+
+Requires one optional library (no PyTorch needed for the recommended option):
+
+```bash
+pip install fastembed          # recommended — ONNX-based, ~50 MB model download on first use
+# or
+pip install sentence-transformers  # PyTorch-based alternative
+```
+
+If neither is installed, `session_search` falls back transparently to FTS5 keyword search — same behavior as before.
+
+**Query style:**
+
+| Goal | Example query |
+|---|---|
+| Semantic (natural language) | `"debugging auth token expiry"` |
+| Keyword (exact terms) | `"JWT OR token OR expiry"` |
+| Phrase | `"docker networking"` |
+| Boolean | `"python NOT java"` |
+
+The result JSON includes a `search_mode` field — `"keyword"` when only FTS5 ran, `"hybrid"` when both ran.
 
 ---
 

@@ -11,7 +11,13 @@
   <a href="https://nousresearch.com"><img src="https://img.shields.io/badge/Built%20by-Nous%20Research-blueviolet?style=for-the-badge" alt="Built by Nous Research"></a>
 </p>
 
-**The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
+**A fork of [Hermes Agent](https://github.com/NousResearch/hermes-agent) by [Nous Research](https://nousresearch.com), extended with features not yet in the official release.** The upstream agent has a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, and builds a deepening model of who you are across sessions. This fork adds on top of that:
+
+- **Specialized subagent roles** — delegate with `role="reviewer"` or `role="coder"` and get a subagent with a purpose-built prompt, toolset, and enforced constraints instead of the generic default
+- **Subagent result verification** — after a subagent returns, the parent cross-checks file existence claims and flags hallucinated completions before acting on them
+- **Semantic session search** — past conversations are vector-embedded and searched by meaning, not just keywords, so Hermes can find "that CORS debugging session" without exact word matches
+
+Everything else — multiplatform gateway, cron scheduling, memory, skills, terminal backends — comes from upstream and is documented at [hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/).
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), [OpenRouter](https://openrouter.ai) (200+ models), [z.ai/GLM](https://z.ai), [Kimi/Moonshot](https://platform.moonshot.ai), [MiniMax](https://www.minimax.io), OpenAI, or your own endpoint. Switch with `hermes model` — no code changes, no lock-in.
 

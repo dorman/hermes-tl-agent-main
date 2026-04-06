@@ -32,6 +32,7 @@ from tools.subagent_channel import (
     ASK_PARENT_SCHEMA,
 )
 from tools.roles import RoleConfig, get_role_config, VALID_ROLES
+from tools.verification import verify_result, WRITE_TOOL_NAMES as _WRITE_TOOL_NAMES
 
 
 # Tools that children must never have access to
@@ -91,6 +92,51 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
         "delegation", "clarify", "memory", "code_execution",
     }
     return [t for t in toolsets if t not in blocked_toolset_names]
+
+
+def _enrich_trace_entry(entry: Dict[str, Any], raw_args: str) -> None:
+    """
+    Augment a tool trace entry with information extracted from the raw JSON
+    arguments — specifically, file paths written by write_file and patch calls.
+
+    This is called at trace-build time (inside _run_single_child) so that the
+    verification pass has authoritative path data without re-parsing messages.
+
+    Mutates entry in place; never raises.
+    """
+    if entry.get("tool") not in _WRITE_TOOL_NAMES:
+        return
+    try:
+        args = json.loads(raw_args or "{}")
+    except Exception:
+        return
+
+    paths: list[str] = []
+    tool = entry["tool"]
+
+    if tool == "write_file":
+        p = args.get("path")
+        if p:
+            paths.append(str(p))
+
+    elif tool == "patch":
+        # replace mode: explicit path arg
+        p = args.get("path")
+        if p:
+            paths.append(str(p))
+        # patch (V4A) mode: paths embedded in the patch text
+        patch_text = args.get("patch") or ""
+        if patch_text:
+            import re as _re
+            for m in _re.finditer(
+                r"^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$",
+                patch_text,
+                _re.MULTILINE,
+            ):
+                paths.append(m.group(1).strip())
+
+    if paths:
+        entry["paths_written"] = paths
 
 
 def _build_child_progress_callback(task_index: int, parent_agent, task_count: int = 1) -> Optional[callable]:
@@ -385,10 +431,13 @@ def _run_single_child(
                 if msg.get("role") == "assistant":
                     for tc in (msg.get("tool_calls") or []):
                         fn = tc.get("function", {})
+                        raw_args = fn.get("arguments", "")
                         entry_t = {
                             "tool": fn.get("name", "unknown"),
-                            "args_bytes": len(fn.get("arguments", "")),
+                            "args_bytes": len(raw_args),
                         }
+                        # Enrich write-tool entries with paths_written for verification
+                        _enrich_trace_entry(entry_t, raw_args)
                         tool_trace.append(entry_t)
                         tc_id = tc.get("id")
                         if tc_id:
@@ -493,6 +542,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    verify: bool = False,
     parent_agent=None,
 ) -> str:
     """
@@ -615,6 +665,9 @@ def delegate_task(
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
         result = _run_single_child(0, _t["goal"], child, parent_agent)
+        task_verify = _t.get("verify", verify)
+        if task_verify and result.get("status") == "completed":
+            result["verification"] = verify_result(result)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -646,6 +699,11 @@ def delegate_task(
                         "api_calls": 0,
                         "duration_seconds": 0,
                     }
+                task_idx = entry["task_index"]
+                task_def = task_list[task_idx] if task_idx < len(task_list) else {}
+                task_verify = task_def.get("verify", verify)
+                if task_verify and entry.get("status") == "completed":
+                    entry["verification"] = verify_result(entry)
                 results.append(entry)
                 completed_count += 1
 
@@ -886,6 +944,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": VALID_ROLES,
                             "description": "Role for this task (overrides top-level role)",
                         },
+                        "verify": {
+                            "type": "boolean",
+                            "description": "Verify this task's result (overrides top-level verify)",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -916,6 +978,19 @@ DELEGATE_TASK_SCHEMA = {
                     "Individual tasks in a batch can override with their own 'role' field."
                 ),
             },
+            "verify": {
+                "type": "boolean",
+                "description": (
+                    "When true, run a verification pass after each subagent completes. "
+                    "Checks that files the summary claims were created or modified actually "
+                    "exist on disk, and flags summaries that describe file writes when the "
+                    "tool trace shows no write-tool calls (hallucination signal). "
+                    "Adds a 'verification' dict to each result: {verified, checks, "
+                    "write_tools_used, run_tools_used, suspicious, note}. "
+                    "Does not change the result status — the parent decides how to act. "
+                    "Default: false. Individual batch tasks can set their own 'verify' field."
+                ),
+            },
         },
         "required": [],
     },
@@ -936,6 +1011,7 @@ registry.register(
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        verify=bool(args.get("verify", False)),
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",

@@ -6,12 +6,11 @@
 
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Docs-hermes--agent.nousresearch.com-FFD700?style=for-the-badge" alt="Documentation"></a>
-  <a href="https://discord.gg/NousResearch"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://github.com/NousResearch/hermes-agent/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
   <a href="https://nousresearch.com"><img src="https://img.shields.io/badge/Built%20by-Nous%20Research-blueviolet?style=for-the-badge" alt="Built by Nous Research"></a>
 </p>
 
-**A fork of [Hermes Agent](https://github.com/NousResearch/hermes-agent) by [Nous Research](https://nousresearch.com), extended with features not yet in the official release.** The upstream agent has a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, and builds a deepening model of who you are across sessions. This fork adds on top of that:
+**A fork of [Hermes Agent](https://github.com/NousResearch/hermes-agent) by [Nous Research](https://nousresearch.com), extended with features not yet in the official release.** The upstream agent has a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, and builds a deepening model of who you are across sessions. This fork adds on top of that with these features:
 
 - **Specialized subagent roles** — delegate with `role="reviewer"` or `role="coder"` and get a subagent with a purpose-built prompt, toolset, and enforced constraints instead of the generic default
 - **Subagent result verification** — after a subagent returns, the parent cross-checks file existence claims and flags hallucinated completions before acting on them
@@ -269,16 +268,6 @@ python -m pytest tests/ -q
 > git submodule update --init tinker-atropos
 > uv pip install -e "./tinker-atropos"
 > ```
-
----
-
-## Community
-
-- 💬 [Discord](https://discord.gg/NousResearch)
-- 📚 [Skills Hub](https://agentskills.io)
-- 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
-- 💡 [Discussions](https://github.com/NousResearch/hermes-agent/discussions)
-
 ---
 
 ## License

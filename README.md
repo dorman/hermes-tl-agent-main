@@ -16,6 +16,7 @@
 - **Specialized subagent roles** — delegate with `role="reviewer"` or `role="coder"` and get a subagent with a purpose-built prompt, toolset, and enforced constraints instead of the generic default
 - **Subagent result verification** — after a subagent returns, the parent cross-checks file existence claims and flags hallucinated completions before acting on them
 - **Semantic session search** — past conversations are vector-embedded and searched by meaning, not just keywords, so Hermes can find "that CORS debugging session" without exact word matches
+- **Shared memory between subagents** — a session-scoped scratch space parallel subagents can read and write to share discovered facts without touching `MEMORY.md`
 
 Everything else — multiplatform gateway, cron scheduling, memory, skills, terminal backends — comes from upstream and is documented at [hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/).
 
@@ -26,7 +27,7 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
 <tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. Hybrid keyword + semantic (vector embedding) session search for cross-session recall — finds "that time I debugged a CORS issue" even without exact words. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
 <tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
-<tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams with specialized roles (researcher, coder, reviewer, tester) — each with a tailored system prompt, toolset, and constraints. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
+<tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams with specialized roles (researcher, coder, reviewer, tester) — each with a tailored system prompt, toolset, and constraints. Parallel subagents share a session-scoped scratch space (<code>shared_memory=True</code>) to exchange findings without polluting long-term memory. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
 <tr><td><b>Runs anywhere, not just your laptop</b></td><td>Six terminal backends — local, Docker, SSH, Daytona, Singularity, and Modal. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
 <tr><td><b>Research-ready</b></td><td>Batch trajectory generation, Atropos RL environments, trajectory compression for training the next generation of tool-calling models.</td></tr>
 </table>
@@ -209,6 +210,41 @@ Four built-in roles:
 The `reviewer` role enforces read-only behavior structurally: write tools (`write_file`, `edit_file`, `create_file`, `run_command`) are removed from the child's valid tool list at construction time, not just by prompt instruction.
 
 To add a custom role, extend `ROLE_REGISTRY` in `tools/roles.py` with a `RoleConfig` dataclass entry.
+
+---
+
+## Shared Memory Between Subagents
+
+When parallel subagents need to share discovered facts without contaminating long-term memory, enable `shared_memory=True` on a delegation call.
+
+```
+delegate_task(
+  tasks=[
+    {"goal": "Find the root cause of the auth regression", "role": "researcher"},
+    {"goal": "Audit all endpoints that touch the auth module", "role": "reviewer"},
+  ],
+  shared_memory=True
+)
+```
+
+All subagents in the batch share a single session-scoped key-value store. Each subagent can read from and write to it concurrently using three tools:
+
+| Tool | Purpose |
+|---|---|
+| `shared_memory_write` | Store a fact under a short snake_case key (max 2000 chars) |
+| `shared_memory_read` | Read one key, or all entries if no key given |
+| `shared_memory_delete` | Remove a stale or incorrect entry |
+
+**How it works:**
+
+- The store is created when `delegate_task` is called and destroyed when the call ends — nothing persists to `MEMORY.md` or any database.
+- Values are scanned with the same injection-detection logic as long-term memory before being accepted.
+- All reads and writes are thread-safe (backed by `threading.RLock`), so parallel subagents can't corrupt each other's data.
+- After all subagents finish, the final store contents are returned to the parent in the result JSON as `shared_memory: {key: value, ...}`.
+
+**Capacity limits** (per delegation call): 100 entries, 64-char keys, 2000-char values.
+
+The shared memory toolset is structurally blocked from the parent and from non-shared-memory delegation calls — a subagent cannot access or pollute another call's store.
 
 ---
 

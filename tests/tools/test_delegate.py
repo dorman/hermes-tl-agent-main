@@ -1085,5 +1085,267 @@ class TestRoleIntegration(unittest.TestCase):
             self.assertIn("read_file", mock_child.valid_tool_names)
 
 
+class TestSharedMemory(unittest.TestCase):
+    """Tests for the shared_memory=True delegation parameter."""
+
+    # ------------------------------------------------------------------
+    # SharedMemory unit tests
+    # ------------------------------------------------------------------
+
+    def test_write_and_read_single_key(self):
+        from tools.shared_memory import SharedMemory
+        store = SharedMemory()
+        result = store.write("root_cause", "null pointer in auth.py:42")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "added")
+        r = store.read("root_cause")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["value"], "null pointer in auth.py:42")
+
+    def test_write_updates_existing_key(self):
+        from tools.shared_memory import SharedMemory
+        store = SharedMemory()
+        store.write("k", "v1")
+        result = store.write("k", "v2")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(store.read("k")["value"], "v2")
+
+    def test_read_all_entries(self):
+        from tools.shared_memory import SharedMemory
+        store = SharedMemory()
+        store.write("a", "1")
+        store.write("b", "2")
+        r = store.read()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["entry_count"], 2)
+        self.assertEqual(r["entries"]["a"], "1")
+
+    def test_read_missing_key_returns_error(self):
+        from tools.shared_memory import SharedMemory
+        store = SharedMemory()
+        r = store.read("nonexistent")
+        self.assertFalse(r["ok"])
+        self.assertIn("available_keys", r)
+
+    def test_delete_existing_key(self):
+        from tools.shared_memory import SharedMemory
+        store = SharedMemory()
+        store.write("tmp", "data")
+        d = store.delete("tmp")
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["entry_count"], 0)
+        self.assertFalse(store.read("tmp")["ok"])
+
+    def test_delete_missing_key_returns_error(self):
+        from tools.shared_memory import SharedMemory
+        store = SharedMemory()
+        d = store.delete("ghost")
+        self.assertFalse(d["ok"])
+        self.assertIn("keys", d)
+
+    def test_capacity_limit(self):
+        from tools.shared_memory import SharedMemory, MAX_ENTRIES
+        store = SharedMemory()
+        for i in range(MAX_ENTRIES):
+            r = store.write(f"key_{i}", "v")
+            self.assertTrue(r["ok"])
+        overflow = store.write("overflow_key", "v")
+        self.assertFalse(overflow["ok"])
+        self.assertIn("full", overflow["error"])
+
+    def test_key_too_long_rejected(self):
+        from tools.shared_memory import SharedMemory, MAX_KEY_LEN
+        store = SharedMemory()
+        r = store.write("x" * (MAX_KEY_LEN + 1), "value")
+        self.assertFalse(r["ok"])
+        self.assertIn("too long", r["error"])
+
+    def test_value_too_long_rejected(self):
+        from tools.shared_memory import SharedMemory, MAX_VALUE_LEN
+        store = SharedMemory()
+        r = store.write("k", "x" * (MAX_VALUE_LEN + 1))
+        self.assertFalse(r["ok"])
+        self.assertIn("too long", r["error"])
+
+    def test_empty_key_rejected(self):
+        from tools.shared_memory import SharedMemory
+        store = SharedMemory()
+        r = store.write("", "value")
+        self.assertFalse(r["ok"])
+        self.assertIn("empty", r["error"])
+
+    def test_snapshot_returns_copy(self):
+        from tools.shared_memory import SharedMemory
+        store = SharedMemory()
+        store.write("x", "1")
+        snap = store.snapshot()
+        store.write("x", "2")
+        # snapshot is a point-in-time copy, not a live view
+        self.assertEqual(snap["x"], "1")
+
+    def test_thread_local_isolation(self):
+        """Two threads with different stores don't contaminate each other."""
+        from tools.shared_memory import SharedMemory, set_thread_shared_memory, get_thread_shared_memory
+        store_a = SharedMemory()
+        store_b = SharedMemory()
+        store_a.write("key", "A")
+        store_b.write("key", "B")
+
+        results = {}
+
+        def _run(name, store):
+            set_thread_shared_memory(store)
+            results[name] = get_thread_shared_memory().read("key")["value"]
+            set_thread_shared_memory(None)
+
+        t1 = threading.Thread(target=_run, args=("t1", store_a))
+        t2 = threading.Thread(target=_run, args=("t2", store_b))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        self.assertEqual(results["t1"], "A")
+        self.assertEqual(results["t2"], "B")
+
+    # ------------------------------------------------------------------
+    # Tool handler tests (no shared memory → error)
+    # ------------------------------------------------------------------
+
+    def test_write_handler_no_store_returns_error(self):
+        from tools.shared_memory import _handle_write, set_thread_shared_memory
+        set_thread_shared_memory(None)
+        r = json.loads(_handle_write({"key": "k", "value": "v"}))
+        self.assertFalse(r["ok"])
+        self.assertIn("not enabled", r["error"])
+
+    def test_read_handler_no_store_returns_error(self):
+        from tools.shared_memory import _handle_read, set_thread_shared_memory
+        set_thread_shared_memory(None)
+        r = json.loads(_handle_read({}))
+        self.assertFalse(r["ok"])
+
+    def test_delete_handler_no_store_returns_error(self):
+        from tools.shared_memory import _handle_delete, set_thread_shared_memory
+        set_thread_shared_memory(None)
+        r = json.loads(_handle_delete({"key": "k"}))
+        self.assertFalse(r["ok"])
+
+    def test_write_handler_with_store(self):
+        from tools.shared_memory import _handle_write, set_thread_shared_memory, SharedMemory
+        store = SharedMemory()
+        set_thread_shared_memory(store)
+        try:
+            r = json.loads(_handle_write({"key": "finding", "value": "auth bug"}))
+            self.assertTrue(r["ok"])
+            self.assertEqual(store.read("finding")["value"], "auth bug")
+        finally:
+            set_thread_shared_memory(None)
+
+    # ------------------------------------------------------------------
+    # Integration: delegate_task with shared_memory=True
+    # ------------------------------------------------------------------
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_shared_memory_snapshot_in_result(self, mock_run):
+        """shared_memory=True → result contains 'shared_memory' snapshot."""
+        from tools.shared_memory import set_thread_shared_memory
+
+        def _fake_run(task_index, goal, child=None, parent_agent=None, **kw):
+            # Simulate the child writing to the shared store
+            store = getattr(child, '_shared_memory_store', None)
+            if store:
+                store.write("root_cause", "auth.py line 42")
+            return {
+                "task_index": task_index, "status": "completed",
+                "summary": "Done", "api_calls": 1, "duration_seconds": 1.0,
+            }
+
+        mock_run.side_effect = _fake_run
+        parent = _make_mock_parent()
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.valid_tool_names = {"read_file", "write_file"}
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Find bug", shared_memory=True, parent_agent=parent)
+            )
+
+        self.assertIn("shared_memory", result)
+        self.assertEqual(result["shared_memory"].get("root_cause"), "auth.py line 42")
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_no_shared_memory_key_when_disabled(self, mock_run):
+        """shared_memory=False (default) → result does NOT contain 'shared_memory'."""
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed",
+            "summary": "Done", "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent()
+        result = json.loads(delegate_task(goal="Do thing", parent_agent=parent))
+        self.assertNotIn("shared_memory", result)
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_shared_memory_tools_injected_into_child(self, mock_run):
+        """shared_memory=True → SHARED_MEMORY_TOOL_NAMES added to child.valid_tool_names."""
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed",
+            "summary": "Done", "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent()
+        from tools.shared_memory import SHARED_MEMORY_TOOL_NAMES
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.valid_tool_names = {"read_file"}
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Find bug", shared_memory=True, parent_agent=parent)
+
+        for name in SHARED_MEMORY_TOOL_NAMES:
+            self.assertIn(name, mock_child.valid_tool_names)
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_shared_memory_tools_not_injected_when_disabled(self, mock_run):
+        """shared_memory=False → SHARED_MEMORY_TOOL_NAMES NOT added to child.valid_tool_names."""
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed",
+            "summary": "Done", "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent()
+        from tools.shared_memory import SHARED_MEMORY_TOOL_NAMES
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.valid_tool_names = {"read_file"}
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Find bug", shared_memory=False, parent_agent=parent)
+
+        for name in SHARED_MEMORY_TOOL_NAMES:
+            self.assertNotIn(name, mock_child.valid_tool_names)
+
+    def test_schema_has_shared_memory_field(self):
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("shared_memory", props)
+        self.assertEqual(props["shared_memory"]["type"], "boolean")
+
+    def test_shared_memory_toolset_blocked(self):
+        """_strip_blocked_tools removes 'shared_memory' toolset."""
+        result = _strip_blocked_tools(["file", "shared_memory", "terminal"])
+        self.assertNotIn("shared_memory", result)
+        self.assertIn("file", result)
+        self.assertIn("terminal", result)
+
+
 if __name__ == "__main__":
     unittest.main()

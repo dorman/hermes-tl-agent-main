@@ -33,6 +33,11 @@ from tools.subagent_channel import (
 )
 from tools.roles import RoleConfig, get_role_config, VALID_ROLES
 from tools.verification import verify_result, WRITE_TOOL_NAMES as _WRITE_TOOL_NAMES
+from tools.shared_memory import (
+    SharedMemory,
+    set_thread_shared_memory,
+    SHARED_MEMORY_TOOL_NAMES,
+)
 
 
 # Tools that children must never have access to
@@ -89,7 +94,7 @@ def _build_child_system_prompt(
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     """Remove toolsets that contain only blocked tools."""
     blocked_toolset_names = {
-        "delegation", "clarify", "memory", "code_execution",
+        "delegation", "clarify", "memory", "code_execution", "shared_memory",
     }
     return [t for t in toolsets if t not in blocked_toolset_names]
 
@@ -226,6 +231,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     channel: Optional[SubagentChannel] = None,
     role_config: Optional[RoleConfig] = None,
+    shared_memory_store: Optional[SharedMemory] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -309,6 +315,14 @@ def _build_child_agent(
         if hasattr(child, 'valid_tool_names') and child.valid_tool_names is not None:
             child.valid_tool_names = set(child.valid_tool_names) - role_config.blocked_tools
 
+    # Inject shared memory tools if a store is provided.
+    # shared_memory tools are in BLOCKED_TOOLSET_NAMES so they are never
+    # part of the standard tool set — they're only added explicitly here.
+    if shared_memory_store is not None:
+        child._shared_memory_store = shared_memory_store
+        if hasattr(child, 'valid_tool_names') and child.valid_tool_names is not None:
+            child.valid_tool_names = set(child.valid_tool_names) | SHARED_MEMORY_TOOL_NAMES
+
     # Register child for interrupt propagation
     if hasattr(parent_agent, '_active_children'):
         lock = getattr(parent_agent, '_active_children_lock', None)
@@ -358,6 +372,11 @@ def _run_single_child(
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, 'tool_progress_callback', None)
+
+    # Activate shared memory for this thread if a store was attached
+    _sm_store = getattr(child, '_shared_memory_store', None)
+    if _sm_store is not None:
+        set_thread_shared_memory(_sm_store)
 
     # Set up two-way channel if the child has one
     channel: Optional[SubagentChannel] = getattr(child, '_subagent_channel', None)
@@ -515,6 +534,10 @@ def _run_single_child(
             from tools.subagent_channel import set_thread_channel
             set_thread_channel(None)
 
+        # Clear thread-local shared memory reference
+        if _sm_store is not None:
+            set_thread_shared_memory(None)
+
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
         import model_tools
@@ -543,6 +566,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     verify: bool = False,
+    shared_memory: bool = False,
     parent_agent=None,
 ) -> str:
     """
@@ -574,6 +598,9 @@ def delegate_task(
             top_role_config = get_role_config(role)
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
+
+    # Shared memory store — one instance shared by all children in this call
+    shared_memory_store: Optional[SharedMemory] = SharedMemory() if shared_memory else None
 
     # Load config
     cfg = _load_config()
@@ -653,6 +680,7 @@ def delegate_task(
                 override_api_mode=creds["api_mode"],
                 channel=channel,
                 role_config=task_role_config,
+                shared_memory_store=shared_memory_store,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -748,10 +776,14 @@ def delegate_task(
 
     total_duration = round(time.monotonic() - overall_start, 2)
 
-    return json.dumps({
+    output: Dict[str, Any] = {
         "results": results,
         "total_duration_seconds": total_duration,
-    }, ensure_ascii=False)
+    }
+    if shared_memory_store is not None:
+        output["shared_memory"] = shared_memory_store.snapshot()
+
+    return json.dumps(output, ensure_ascii=False)
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -991,6 +1023,22 @@ DELEGATE_TASK_SCHEMA = {
                     "Default: false. Individual batch tasks can set their own 'verify' field."
                 ),
             },
+            "shared_memory": {
+                "type": "boolean",
+                "description": (
+                    "When true, all subagents in this call share a session-scoped "
+                    "key-value scratch space. Subagents can read and write facts "
+                    "(shared_memory_write / shared_memory_read / shared_memory_delete) "
+                    "without touching long-term memory or MEMORY.md. "
+                    "Useful for parallel workstreams that discover related facts — "
+                    "e.g. one subagent finds the root cause while another is still "
+                    "running and can read it to focus its own search. "
+                    "After all subagents finish, the final store snapshot is included "
+                    "in the result as 'shared_memory': {key: value, ...}. "
+                    "The store is discarded when the delegation call ends. "
+                    "Default: false."
+                ),
+            },
         },
         "required": [],
     },
@@ -1012,6 +1060,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         verify=bool(args.get("verify", False)),
+        shared_memory=bool(args.get("shared_memory", False)),
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",
